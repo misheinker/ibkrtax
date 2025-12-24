@@ -1,0 +1,5 @@
+pandas
+yfinance
+pandas_datareader
+setuptools
+lxml

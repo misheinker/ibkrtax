@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+ibkr_reports/
+Tax_Report_*.csv
+*.csv
+*.pyc
