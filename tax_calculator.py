@@ -13,6 +13,36 @@ TARGET_CURRENCY = 'USD'
 # We will reconstruct an index from this.
 CPI_SERIES_ID = 'CPALTT01ILM657N' 
 
+def get_account_info(folder_path):
+    """
+    Extracts the Name and Account Number from the first CSV file in the folder.
+    """
+    files = glob.glob(os.path.join(folder_path, "*.csv"))
+    if not files:
+        return "Unknown", "Unknown"
+    
+    file = files[0]
+    name = "Unknown"
+    account = "Unknown"
+    
+    try:
+        import csv
+        with open(file, 'r', encoding='utf-8-sig') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 4 and row[0] == "Account Information" and row[1] == "Data":
+                    if row[2] == "Name":
+                        name = row[3]
+                    elif row[2] == "Account":
+                        account = row[3]
+                
+                if name != "Unknown" and account != "Unknown":
+                    break
+    except Exception as e:
+        print(f"Error reading account info: {e}")
+        
+    return name, account
+
 def parse_ibkr_reports(folder_path):
     """
     Reads all CSV files in the folder and extracts the Trades section.
@@ -99,6 +129,76 @@ def parse_ibkr_reports(folder_path):
     if 'Date/Time' in df.columns:
         df = df.sort_values('Date/Time')
     
+    return df
+
+def parse_dividends_and_interest(folder_path):
+    """
+    Reads all CSV files in the folder and extracts Dividends and Interest sections.
+    Returns a combined dataframe with Date, Type, Amount (USD), Description.
+    """
+    import csv
+    from io import StringIO
+    
+    files = glob.glob(os.path.join(folder_path, "*.csv"))
+    all_income = []
+    
+    for file in files:
+        try:
+            with open(file, 'r', encoding='utf-8-sig') as f:
+                lines = f.readlines()
+            
+            # Parse Dividends
+            for i, line in enumerate(lines):
+                if line.startswith("Dividends,Header"):
+                    # Found dividend section
+                    j = i + 1
+                    while j < len(lines) and lines[j].startswith("Dividends,Data,"):
+                        parts = lines[j].strip().split(',')
+                        # Format: Dividends,Data,USD,2024-02-01,Description,Amount
+                        if len(parts) >= 6 and parts[2] == 'USD' and parts[1] == 'Data':
+                            try:
+                                date_str = parts[3]
+                                amount = float(parts[5])
+                                desc = parts[4] if len(parts) > 4 else ''
+                                all_income.append({
+                                    'Date': pd.to_datetime(date_str).date(),
+                                    'Type': 'Dividend',
+                                    'Amount_USD': amount,
+                                    'Description': desc
+                                })
+                            except:
+                                pass
+                        j += 1
+                
+                # Parse Interest
+                if line.startswith("Interest,Header"):
+                    j = i + 1
+                    while j < len(lines) and lines[j].startswith("Interest,Data,"):
+                        parts = lines[j].strip().split(',')
+                        # Format: Interest,Data,USD,Date,Description,Amount
+                        if len(parts) >= 6 and parts[2] == 'USD' and parts[1] == 'Data':
+                            try:
+                                date_str = parts[3]
+                                amount = float(parts[5])
+                                desc = parts[4] if len(parts) > 4 else ''
+                                all_income.append({
+                                    'Date': pd.to_datetime(date_str).date(),
+                                    'Type': 'Interest',
+                                    'Amount_USD': amount,
+                                    'Description': desc
+                                })
+                            except:
+                                pass
+                        j += 1
+                        
+        except Exception as e:
+            print(f"Error parsing dividends/interest from {file}: {e}")
+    
+    if not all_income:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(all_income)
+    df = df.sort_values('Date')
     return df
 
 def get_fx_rates(dates):
@@ -290,124 +390,173 @@ def process_fifo(trades_df):
     return pd.DataFrame(matches)
 
 def main(folder_path, tax_year):
+    # Get Account Info
+    name, account_id = get_account_info(folder_path)
+    print(f"Generating report for: {name} ({account_id})")
+
     # 1. Parse Trades
     print(f"Parsing trades from {folder_path}...")
     trades = parse_ibkr_reports(folder_path)
-    if trades.empty:
-        print("No trades found.")
+    
+    # 2. Parse Dividends and Interest
+    print(f"Parsing dividends and interest from {folder_path}...")
+    income_df = parse_dividends_and_interest(folder_path)
+    
+    if trades.empty and income_df.empty:
+        print("No trades or income found.")
         return
 
-    # 2. FIFO Matching
-    print("Processing FIFO...")
-    matches = process_fifo(trades)
-    if matches.empty:
-        print("No matches found.")
-        return
+    # 3. FIFO Matching for trades
+    matches = pd.DataFrame()
+    if not trades.empty:
+        print("Processing FIFO...")
+        matches = process_fifo(trades)
+    
+    # 4. Process Income (Dividends & Interest)
+    income_report = pd.DataFrame()
+    if not income_df.empty:
+        print("Processing dividends and interest...")
+        # Filter for tax year
+        income_df['Year'] = income_df['Date'].apply(lambda d: d.year)
+        income_report = income_df[income_df['Year'] == int(tax_year)].copy()
         
-    # 3. FX Conversion
-    print("Fetching FX rates...")
-    all_dates = pd.concat([matches['Buy Date'], matches['Sell Date']]).unique()
-    all_dates = sorted([d for d in all_dates if isinstance(d, datetime.date)])
-    
-    fx_rates = get_fx_rates(all_dates)
-    
-    matches['Buy Rate'] = matches['Buy Date'].map(lambda d: fx_rates.get(d, 0))
-    matches['Sell Rate'] = matches['Sell Date'].map(lambda d: fx_rates.get(d, 0))
-    
-    matches['Buy Price ILS'] = matches['Buy Price USD'] * matches['Buy Rate']
-    matches['Sell Price ILS'] = matches['Sell Price USD'] * matches['Sell Rate']
-    matches['Buy Comm ILS'] = matches['Buy Comm USD'] * matches['Buy Rate']
-    matches['Sell Comm ILS'] = matches['Sell Comm USD'] * matches['Sell Rate']
-    
-    # Total Basis and Proceeds in ILS
-    # Basis = (Price * Qty) + abs(Comm)  (Comm is negative)
-    # Proceeds = (Price * Qty) + Comm    (Comm is negative)
-    # Wait, usually:
-    # Cost Basis = (Buy Price * Qty) + Commission Paid (Positive value)
-    # Net Proceeds = (Sell Price * Qty) - Commission Paid (Positive value)
-    # In the data, Comm is negative.
-    # So Cost Basis = (Buy Price * Qty) - Buy Comm
-    # Net Proceeds = (Sell Price * Qty) + Sell Comm
-    
-    matches['Cost Basis ILS'] = (matches['Buy Price ILS'] * matches['Quantity']) - matches['Buy Comm ILS']
-    matches['Net Proceeds ILS'] = (matches['Sell Price ILS'] * matches['Quantity']) + matches['Sell Comm ILS']
-    
-    # 4. Inflation Adjustment
-    print("Fetching Inflation data...")
-    min_date = matches['Buy Date'].min()
-    max_date = matches['Sell Date'].max()
-    
-    cpi_index = get_cpi_index(min_date, max_date)
-    
-    def get_cpi(d):
-        ts = pd.Timestamp(d)
-        # Find nearest previous index
-        # If exact match missing, use asof
-        if ts in cpi_index.index:
-            return cpi_index.loc[ts]
-        else:
-            # Use asof to get the latest available CPI before or on this date
-            idx = cpi_index.index.asof(ts)
-            if pd.isna(idx):
-                return cpi_index.iloc[0] # Fallback to first
-            return cpi_index.loc[idx]
-
-    matches['Buy CPI'] = matches['Buy Date'].map(get_cpi)
-    matches['Sell CPI'] = matches['Sell Date'].map(get_cpi)
-    
-    matches['Inflation Factor'] = matches['Sell CPI'] / matches['Buy CPI']
-    matches['Adjusted Cost Basis ILS'] = matches['Cost Basis ILS'] * matches['Inflation Factor']
-    
-    # 5. Tax Calculation
-    matches['Real Gain ILS'] = matches['Net Proceeds ILS'] - matches['Adjusted Cost Basis ILS']
-    matches['Nominal Gain ILS'] = matches['Net Proceeds ILS'] - matches['Cost Basis ILS']
-    
-    # Filter for Tax Year
-    # Tax event is on the Closing Date
-    # For Long: Sell Date
-    # For Short: Buy Date (Cover Date)
-    
-    def get_tax_year(row):
-        if row['Type'] == 'Short':
-            return pd.to_datetime(row['Buy Date']).year
-        else:
-            return pd.to_datetime(row['Sell Date']).year
+        if not income_report.empty:
+            # Get FX rates for income dates
+            income_dates = income_report['Date'].unique().tolist()
+            income_fx_rates = get_fx_rates(income_dates)
             
-    matches['Tax Year'] = matches.apply(get_tax_year, axis=1)
-    report = matches[matches['Tax Year'] == int(tax_year)].copy()
+            # Convert to ILS
+            income_report['FX_Rate'] = income_report['Date'].map(lambda d: income_fx_rates.get(d, 0))
+            income_report['Amount_ILS'] = income_report['Amount_USD'] * income_report['FX_Rate']
+        
+    # 5. Process Capital Gains (existing logic)
+    capital_gains_report = pd.DataFrame()
+    if not matches.empty:
+        print("Fetching FX rates for trades...")
+        all_dates = pd.concat([matches['Buy Date'], matches['Sell Date']]).unique()
+        all_dates = sorted([d for d in all_dates if isinstance(d, datetime.date)])
+        
+        fx_rates = get_fx_rates(all_dates)
+        
+        matches['Buy Rate'] = matches['Buy Date'].map(lambda d: fx_rates.get(d, 0))
+        matches['Sell Rate'] = matches['Sell Date'].map(lambda d: fx_rates.get(d, 0))
+        
+        matches['Buy Price ILS'] = matches['Buy Price USD'] * matches['Buy Rate']
+        matches['Sell Price ILS'] = matches['Sell Price USD'] * matches['Sell Rate']
+        matches['Buy Comm ILS'] = matches['Buy Comm USD'] * matches['Buy Rate']
+        matches['Sell Comm ILS'] = matches['Sell Comm USD'] * matches['Sell Rate']
+        
+        # Total Basis and Proceeds in ILS
+        matches['Cost Basis ILS'] = (matches['Buy Price ILS'] * matches['Quantity']) - matches['Buy Comm ILS']
+        matches['Net Proceeds ILS'] = (matches['Sell Price ILS'] * matches['Quantity']) + matches['Sell Comm ILS']
+        
+        # Inflation Adjustment
+        print("Fetching Inflation data...")
+        min_date = matches['Buy Date'].min()
+        max_date = matches['Sell Date'].max()
+        
+        cpi_index = get_cpi_index(min_date, max_date)
+        
+        def get_cpi(d):
+            ts = pd.Timestamp(d)
+            if ts in cpi_index.index:
+                return cpi_index.loc[ts]
+            else:
+                idx = cpi_index.index.asof(ts)
+                if pd.isna(idx):
+                    return cpi_index.iloc[0]
+                return cpi_index.loc[idx]
+
+        matches['Buy CPI'] = matches['Buy Date'].map(get_cpi)
+        matches['Sell CPI'] = matches['Sell Date'].map(get_cpi)
+        
+        matches['Inflation Factor'] = matches['Sell CPI'] / matches['Buy CPI']
+        matches['Adjusted Cost Basis ILS'] = matches['Cost Basis ILS'] * matches['Inflation Factor']
+        
+        # Tax Calculation
+        matches['Real Gain ILS'] = matches['Net Proceeds ILS'] - matches['Adjusted Cost Basis ILS']
+        matches['Nominal Gain ILS'] = matches['Net Proceeds ILS'] - matches['Cost Basis ILS']
+        
+        # Filter for Tax Year
+        def get_tax_year(row):
+            if row['Type'] == 'Short':
+                return pd.to_datetime(row['Buy Date']).year
+            else:
+                return pd.to_datetime(row['Sell Date']).year
+                
+        matches['Tax Year'] = matches.apply(get_tax_year, axis=1)
+        capital_gains_report = matches[matches['Tax Year'] == int(tax_year)].copy()
     
-    # Output
-    output_file = f"Tax_Report_{tax_year}.csv"
+    # 6. Output
+    safe_name = "".join([c for c in name if c.isalpha() or c.isdigit() or c==' ']).strip().replace(' ', '_')
+    output_file = f"Tax_Report_{tax_year}_{safe_name}_{account_id}.csv"
     
     with open(output_file, 'w', newline='') as f:
-        f.write("SECTION: FIFO MATCHES AND CALCULATIONS\n")
-        report.to_csv(f, index=False)
+        # Capital Gains Section
+        if not capital_gains_report.empty:
+            f.write("SECTION: CAPITAL GAINS - FIFO MATCHES AND CALCULATIONS\n")
+            capital_gains_report.to_csv(f, index=False)
         
+        # Dividends and Interest Section
+        if not income_report.empty:
+            f.write("\nSECTION: DIVIDENDS AND INTEREST\n")
+            income_report.to_csv(f, index=False)
+        
+        # Summary Section
         f.write("\nSECTION: SUMMARY\n")
-        total_proceeds = report['Net Proceeds ILS'].sum()
-        total_cost_adj = report['Adjusted Cost Basis ILS'].sum()
-        total_gain_real = report['Real Gain ILS'].sum()
-        total_gain_nominal = report['Nominal Gain ILS'].sum()
         
-        f.write(f"Total Proceeds ILS,{total_proceeds}\n")
-        f.write(f"Total Adjusted Cost ILS,{total_cost_adj}\n")
-        f.write(f"Total Real Gain ILS (Taxable Amount),{total_gain_real}\n")
-        f.write(f"Total Nominal Gain ILS,{total_gain_nominal}\n")
+        # Capital Gains Summary
+        if not capital_gains_report.empty:
+            total_proceeds = capital_gains_report['Net Proceeds ILS'].sum()
+            total_cost_adj = capital_gains_report['Adjusted Cost Basis ILS'].sum()
+            total_gain_real = capital_gains_report['Real Gain ILS'].sum()
+            total_gain_nominal = capital_gains_report['Nominal Gain ILS'].sum()
+            
+            f.write(f"Capital Gains - Total Proceeds ILS,{total_proceeds}\n")
+            f.write(f"Capital Gains - Total Adjusted Cost ILS,{total_cost_adj}\n")
+            f.write(f"Capital Gains - Total Real Gain ILS (Taxable),{total_gain_real}\n")
+            f.write(f"Capital Gains - Total Nominal Gain ILS,{total_gain_nominal}\n")
+        else:
+            total_gain_real = 0
+            f.write("Capital Gains - Total Real Gain ILS (Taxable),0\n")
         
-        tax_25 = total_gain_real * 0.25
-        tax_28 = total_gain_real * 0.28
+        # Dividends and Interest Summary
+        if not income_report.empty:
+            total_dividends = income_report[income_report['Type'] == 'Dividend']['Amount_ILS'].sum()
+            total_interest = income_report[income_report['Type'] == 'Interest']['Amount_ILS'].sum()
+            total_income = total_dividends + total_interest
+            
+            f.write(f"Dividends - Total ILS,{total_dividends}\n")
+            f.write(f"Interest - Total ILS,{total_interest}\n")
+            f.write(f"Total Dividend and Interest Income ILS (Taxable),{total_income}\n")
+        else:
+            total_income = 0
+            total_dividends = 0
+            total_interest = 0
+            f.write("Total Dividend and Interest Income ILS (Taxable),0\n")
         
-        f.write(f"Estimated Tax Liability (25%),{tax_25}\n")
-        f.write(f"Estimated Tax Liability (28%),{tax_28}\n")
+        # Combined Tax Estimates
+        f.write(f"\nCombined Taxable Income (Capital Gains + Dividends + Interest),{total_gain_real + total_income}\n")
+        
+        combined_tax_25 = (total_gain_real + total_income) * 0.25
+        combined_tax_28 = (total_gain_real + total_income) * 0.28
+        
+        f.write(f"Estimated Tax Liability (25%),{combined_tax_25}\n")
+        f.write(f"Estimated Tax Liability (28%),{combined_tax_28}\n")
         
         f.write("\nSECTION: EXPLANATION\n")
-        f.write("This report calculates the Capital Gains Tax liability for the specified tax year based on FIFO (First-In, First-Out) accounting principles.\n")
-        f.write("1. Transactions are matched: Sells are matched with the earliest available Buys.\n")
-        f.write("2. Amounts are converted to ILS: All USD amounts are converted to ILS using the daily USD/ILS exchange rate on the transaction date.\n")
+        f.write("This report calculates the tax liability for the specified tax year.\n")
+        f.write("\nCAPITAL GAINS:\n")
+        f.write("1. Transactions are matched using FIFO (First-In, First-Out) accounting.\n")
+        f.write("2. Amounts are converted to ILS using the daily USD/ILS exchange rate on the transaction date.\n")
         f.write("3. Inflation Adjustment: The Cost Basis is adjusted for inflation in Israel from the Buy Date to the Sell Date.\n")
         f.write("   - Adjusted Cost Basis = Cost Basis (ILS) * (CPI at Sell Date / CPI at Buy Date)\n")
         f.write("4. Real Gain: Calculated as Net Proceeds (ILS) - Adjusted Cost Basis (ILS). This is the taxable amount in Israel.\n")
         f.write("5. Nominal Gain: Calculated as Net Proceeds (ILS) - Cost Basis (ILS) (without inflation adjustment).\n")
+        f.write("\nDIVIDENDS AND INTEREST:\n")
+        f.write("1. All dividend and interest payments received in USD are converted to ILS using the exchange rate on the payment date.\n")
+        f.write("2. These amounts are fully taxable as income in Israel.\n")
+        f.write("3. Note: US withholding tax on dividends may be claimed as a credit against Israeli tax (not calculated here).\n")
 
         f.write("\nSECTION: DATA SOURCES\n")
         f.write("Foreign Exchange Rates (USD/ILS): Yahoo Finance (Ticker: USDILS=X)\n")

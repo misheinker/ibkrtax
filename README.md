@@ -9,6 +9,7 @@ This Python script parses Interactive Brokers (IBKR) Activity Statements (CSV fo
 *   **Currency Conversion**: Converts all USD transaction amounts to ILS using historical daily exchange rates (sourced from Yahoo Finance).
 *   **Inflation Adjustment**: Adjusts the Cost Basis for Israeli inflation (CPI) from the purchase date to the sale date (sourced from FRED).
 *   **Tax Calculation**: Calculates "Real Gain" (Taxable Amount) and provides estimated tax liability at 25% and 28%.
+*   **Dividend and Interest Income**: Parses and converts all dividend and interest payments to ILS for tax reporting.
 *   **Spill-over Handling**: Tracks open positions across multiple years (provided you supply the history).
 
 ## Prerequisites
@@ -61,33 +62,58 @@ python tax_calculator.py ibkr_reports 2023
 .venv\Scripts\python tax_calculator.py ibkr_reports 2023
 ```
 
-The script will generate a file named `Tax_Report_2023.csv` in the same directory.
+The script will generate a file named `Tax_Report_<Year>_<Name>_<Account>.csv` in the same directory.
 
 ## Output Explanation
 
-The generated CSV report contains a detailed list of all taxable events (closed positions) and a **SUMMARY** section at the bottom.
+The generated CSV report contains several sections:
+
+1. **CAPITAL GAINS - FIFO MATCHES AND CALCULATIONS**: Detailed list of all closed positions (trades).
+2. **DIVIDENDS AND INTEREST**: All dividend and interest payments received during the tax year.
+3. **SUMMARY**: Aggregated totals and tax calculations.
+4. **EXPLANATION**: Detailed methodology explanation.
+5. **DATA SOURCES**: References for exchange rates and inflation data.
 
 ### Summary Fields
 
-*   **Total Proceeds ILS**:
+**Capital Gains:**
+
+*   **Capital Gains - Total Proceeds ILS**:
     The total net amount received from all sales in the tax year, converted to Shekels (ILS) at the exchange rate on the sale date.
 
-*   **Total Adjusted Cost ILS**:
+*   **Capital Gains - Total Adjusted Cost ILS**:
     The original cost of the assets sold, converted to ILS at the purchase date, and **adjusted for inflation** (Israeli CPI) up to the sale date. This ensures you don't pay tax on inflation.
 
-*   **Total Real Gain ILS (Taxable Amount)**:
+*   **Capital Gains - Total Real Gain ILS (Taxable)**:
     `Total Proceeds` - `Total Adjusted Cost`.
     This is your actual profit in purchasing power terms. This is the amount generally subject to Capital Gains Tax in Israel.
 
-*   **Total Nominal Gain ILS**:
+*   **Capital Gains - Total Nominal Gain ILS**:
     `Total Proceeds` - `Original Cost (in ILS)`.
     Your profit in Shekels ignoring inflation. Provided for reference only.
 
+**Dividends and Interest:**
+
+*   **Dividends - Total ILS**:
+    The total amount of dividend payments received during the tax year, converted to ILS at the exchange rate on each payment date.
+
+*   **Interest - Total ILS**:
+    The total amount of interest (credit or debit) during the tax year, converted to ILS at the exchange rate on each payment date.
+
+*   **Total Dividend and Interest Income ILS (Taxable)**:
+    The sum of all dividends and interest. This amount is fully taxable as income in Israel.
+    **Note**: US withholding tax on dividends (typically 25-30%) may be claimed as a credit against your Israeli tax liability. Consult with your tax advisor on how to report this.
+
+**Combined Tax:**
+
+*   **Combined Taxable Income**:
+    The sum of Capital Gains Real Gain and Dividend/Interest Income.
+
 *   **Estimated Tax Liability (25%)**:
-    25% of the Real Gain. This is the standard rate for individuals.
+    25% of the Combined Taxable Income. This is the standard rate for individuals.
 
 *   **Estimated Tax Liability (28%)**:
-    28% of the Real Gain. This rate applies to "substantial shareholders" or high-income earners subject to Surtax.
+    28% of the Combined Taxable Income. This rate applies to "substantial shareholders" or high-income earners subject to Surtax.
 
 ## Data Sources
 
